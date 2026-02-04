@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { FileUploader } from './components/FileUploader';
 import { Button } from './components/Button';
 import { Toggle } from './components/Toggle';
@@ -6,208 +6,225 @@ import { AnalysisPanel } from './components/AnalysisPanel';
 import { analyzeFace, performFaceSwap } from './services/geminiService';
 import { loadPreferences, updatePreferences } from './services/storageService';
 import { DEFAULT_SWAP_SETTINGS } from './constants';
-import { FaceAnalysisResult, ProcessedImage, SwapSettings, AppSessionState } from './types';
+import { FaceAnalysisResult, ProcessedImage, SwapSettings } from './types';
+import JSZip from 'jszip';
+import saveAs from 'file-saver';
+
+// Simple in-memory cache to prevent re-analyzing the same file
+const analysisCache = new Map<string, FaceAnalysisResult>();
+
+// Helper to hash file for cache key
+const generateFileHash = async (file: File): Promise<string> => {
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+};
 
 function App() {
-  // App Loading State
   const [isStorageLoaded, setIsStorageLoaded] = useState(false);
-
-  // State for Face Swap
-  const [sourceFace, setSourceFace] = useState<string | null>(null);
+  const [sourceFaces, setSourceFaces] = useState<string[]>([]);
   const [targets, setTargets] = useState<ProcessedImage[]>([]);
   const [analysis, setAnalysis] = useState<FaceAnalysisResult | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [settings, setSettings] = useState<SwapSettings>(DEFAULT_SWAP_SETTINGS);
-  const [processingQueue, setProcessingQueue] = useState<string[]>([]);
+  
+  const [isProcessingBatch, setIsProcessingBatch] = useState(false);
+  const [isZipping, setIsZipping] = useState(false); // New State for Zip
   const [autoRestoreMsg, setAutoRestoreMsg] = useState<string | null>(null);
 
-  // Load User Preferences (Full Session Restore) on Mount
+  // Load Preferences
   useEffect(() => {
     const init = async () => {
       try {
         const prefs = await loadPreferences();
         if (prefs) {
-          // Restore Complete Session State if available
           if (prefs.session_state) {
              const s = prefs.session_state;
              setTargets(s.targets || []);
-             setSourceFace(s.sourceFace || null);
+             setSourceFaces(s.sourceFaces || []); 
              setAnalysis(s.analysis || null);
-             
-             if (s.sourceFace || s.targets.length > 0) {
-                 setAutoRestoreMsg("✓ Session Restored");
-                 setTimeout(() => setAutoRestoreMsg(null), 4000);
+             if (s.sourceFaces && s.sourceFaces.length > 0) setAutoRestoreMsg("✓ Session Restored");
+          } else if (prefs.last_used_source) {
+             // Fallback to legacy or new format
+             const lastSource = prefs.last_used_source as any;
+             if (lastSource.images) {
+                setSourceFaces(lastSource.images);
+             } else if (lastSource.image) {
+                setSourceFaces([lastSource.image]);
              }
-          } 
-          // Fallback: If no full session, check for last validated source (bookmarks)
-          else if (prefs.last_used_source?.image) {
-            setSourceFace(prefs.last_used_source.image);
-            setAnalysis(prefs.last_used_source.analysis); 
-            setAutoRestoreMsg("✓ Face Restored");
-            setTimeout(() => setAutoRestoreMsg(null), 4000);
+             
+             setAnalysis(prefs.last_used_source.analysis); 
+             setAutoRestoreMsg("✓ Face Restored");
           }
         }
       } catch (e) {
         console.warn("Failed to load user preferences", e);
       } finally {
         setIsStorageLoaded(true);
+        setTimeout(() => setAutoRestoreMsg(null), 3000);
       }
     };
     init();
   }, []);
 
-  // Auto-save Session State (Debounced)
+  // Auto-save
   useEffect(() => {
-    if (!isStorageLoaded) return; // Don't save before initial load completes
-
+    if (!isStorageLoaded) return;
     const timer = setTimeout(() => {
-      const sessionState: AppSessionState = {
-          targets,
-          sourceFace: sourceFace || undefined,
-          analysis: analysis || undefined,
-      };
-      
-      updatePreferences({ session_state: sessionState }).catch(e => 
-        console.warn("Failed to auto-save session", e)
-      );
-    }, 500); // 500ms debounce for responsiveness
-
-    return () => clearTimeout(timer);
-  }, [isStorageLoaded, targets, sourceFace, analysis]);
-
-  // Save successful face to IndexedDB (Bookmark)
-  const saveSourceFaceToStorage = async (image: string, analysisData: FaceAnalysisResult) => {
-    try {
-      await updatePreferences({
-        last_used_source: {
-          image,
-          analysis: analysisData,
-          timestamp: Date.now()
-        }
+      updatePreferences({ 
+        session_state: { targets, sourceFaces: sourceFaces, analysis: analysis || undefined } 
       });
-    } catch (e) {
-      console.warn("Failed to save user preferences", e);
-    }
-  };
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [isStorageLoaded, targets, sourceFaces, analysis]);
 
-  // Handle file selection
   const handleSourceSelect = async (file: File) => {
+    const hash = await generateFileHash(file);
     const reader = new FileReader();
+    
     reader.onload = async (e) => {
       const base64 = e.target?.result as string;
-      setSourceFace(base64);
-      setAnalysis(null);
-      setAutoRestoreMsg(null); 
-      setIsAnalyzing(true);
-      try {
-        const result = await analyzeFace(base64);
-        setAnalysis(result);
-      } catch (err) {
-        console.error("Analysis failed", err);
-      } finally {
-        setIsAnalyzing(false);
+      
+      // Add to array instead of replacing
+      setSourceFaces(prev => {
+        // Prevent duplicates
+        if (prev.includes(base64)) return prev;
+        // Limit to 3 images
+        if (prev.length >= 3) return prev;
+        return [...prev, base64];
+      });
+
+      // Only analyze if it's the first image (Primary)
+      if (sourceFaces.length === 0) {
+        setAnalysis(null);
+        setAutoRestoreMsg(null); 
+        
+        if (analysisCache.has(hash)) {
+          setAnalysis(analysisCache.get(hash)!);
+          return;
+        }
+
+        setIsAnalyzing(true);
+        try {
+          const result = await analyzeFace(base64);
+          analysisCache.set(hash, result);
+          setAnalysis(result);
+        } catch (err) {
+          console.error("Analysis failed", err);
+        } finally {
+          setIsAnalyzing(false);
+        }
       }
     };
     reader.readAsDataURL(file);
+  };
+
+  const removeSourceImage = (index: number) => {
+      setSourceFaces(prev => {
+          const newFaces = [...prev];
+          newFaces.splice(index, 1);
+          return newFaces;
+      });
+      if (index === 0) setAnalysis(null); // Clear analysis if primary removed
   };
 
   const handleTargetSelect = (file: File) => {
     const reader = new FileReader();
     reader.onload = (e) => {
-      const base64 = e.target?.result as string;
-      const newTarget: ProcessedImage = {
+      setTargets(prev => [...prev, {
         id: Date.now().toString() + Math.random().toString(),
-        originalUrl: base64,
+        originalUrl: e.target?.result as string,
         status: 'idle'
-      };
-      setTargets(prev => [...prev, newTarget]);
+      }]);
     };
     reader.readAsDataURL(file);
   };
 
-  const processQueue = useCallback(async () => {
-    if (processingQueue.length === 0 || !sourceFace) return;
+  // Recursive processor that does NOT depend on useEffect
+  const runBatchProcessor = async () => {
+    if (sourceFaces.length === 0) return;
+    setIsProcessingBatch(true);
 
-    const targetId = processingQueue[0];
-    const target = targets.find(t => t.id === targetId);
+    // Get all idle items at the start
+    const idleIds = targets.filter(t => t.status === 'idle').map(t => t.id);
 
-    if (!target) {
-      setProcessingQueue(prev => prev.slice(1));
-      return;
-    }
+    for (const id of idleIds) {
+      // 1. Update status to processing
+      setTargets(prev => prev.map(t => t.id === id ? { ...t, status: 'processing' } : t));
 
-    setTargets(prev => prev.map(t => t.id === targetId ? { ...t, status: 'processing' } : t));
+      try {
+        // 2. Find current target data (fresh state)
+        const currentTarget = targets.find(t => t.id === id); 
+        // Fallback: search in current state if not found
+        const targetUrl = targets.find(t => t.id === id)?.originalUrl;
+        
+        if (!targetUrl) continue;
 
-    try {
-      const swappedImage = await performFaceSwap(sourceFace, target.originalUrl, settings);
-      
-      // Save this source face as the "Last Used" valid face if successful
-      if (analysis) {
-        saveSourceFaceToStorage(sourceFace, analysis);
+        const swappedImage = await performFaceSwap(sourceFaces, targetUrl, settings);
+        
+        setTargets(prev => prev.map(t => t.id === id ? { 
+          ...t, status: 'completed', processedUrl: swappedImage 
+        } : t));
+
+      } catch (error) {
+        setTargets(prev => prev.map(t => t.id === id ? { 
+          ...t, status: 'failed', error: error instanceof Error ? error.message : 'Error' 
+        } : t));
       }
-
-      setTargets(prev => prev.map(t => t.id === targetId ? { 
-        ...t, 
-        status: 'completed', 
-        processedUrl: swappedImage 
-      } : t));
-
-    } catch (error) {
-       setTargets(prev => prev.map(t => t.id === targetId ? { 
-        ...t, 
-        status: 'failed', 
-        error: error instanceof Error ? error.message : 'Unknown error'
-      } : t));
-    } finally {
-      setProcessingQueue(prev => prev.slice(1));
+      
+      // Small delay to let UI breathe
+      await new Promise(r => setTimeout(r, 200));
     }
-  }, [processingQueue, sourceFace, targets, settings, analysis]);
 
-  useEffect(() => {
-    if (processingQueue.length > 0) {
-      processQueue();
-    }
-  }, [processingQueue, processQueue]);
+    setIsProcessingBatch(false);
+  };
 
-  const startBatchProcessing = () => {
-    const pendingIds = targets.filter(t => t.status === 'idle').map(t => t.id);
-    setProcessingQueue(pendingIds);
+  // Download All Function
+  const downloadAll = async () => {
+    const completed = targets.filter(t => t.status === 'completed' && t.processedUrl);
+    if (completed.length === 0) return;
+
+    setIsZipping(true);
+    const zip = new JSZip();
+    const folder = zip.folder("swapped_faces");
+
+    completed.forEach((target, index) => {
+      if (target.processedUrl) {
+        const base64Data = target.processedUrl.split(',')[1];
+        folder?.file(`swap_${index + 1}.png`, base64Data, { base64: true });
+      }
+    });
+
+    const content = await zip.generateAsync({ type: "blob" });
+    saveAs(content, "gemini_architect_batch.zip");
+    setIsZipping(false);
   };
 
   return (
     <div className="flex h-screen w-full bg-gray-950 text-gray-100 overflow-hidden">
-      
       {/* SIDEBAR */}
       <div className="w-80 border-r border-gray-800 flex flex-col bg-gray-900 z-10 shadow-2xl">
         <div className="p-4 border-b border-gray-800">
             <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">Gemini Architect</h1>
-            <p className="text-xs text-gray-500 mt-1">Powered by Gemini 3 Pro</p>
+            <p className="text-xs text-gray-500 mt-1">Engine: Gemini 3 Pro + Flash</p>
         </div>
 
-        {/* Removed Tab Navigation */}
-
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          
-          {/* SOURCE UPLOAD */}
           <div>
-            <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Source Face</h3>
+            <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Source Identity</h3>
             <FileUploader 
-              label="Upload Face" 
+              label="Upload Source" 
               onFileSelect={handleSourceSelect} 
-              currentImage={sourceFace}
+              currentImages={sourceFaces} 
               statusMessage={autoRestoreMsg}
-              onClear={() => { 
-                setSourceFace(null); 
-                setAnalysis(null); 
-                setAutoRestoreMsg(null);
-              }}
+              onClear={() => { setSourceFaces([]); setAnalysis(null); }}
+              onRemoveSingle={removeSourceImage}
               compact
             />
           </div>
 
-          {/* SETTINGS */}
           <div>
-              <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Architect Controls</h3>
+              <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Controls</h3>
               <div className="space-y-0 divide-y divide-gray-800">
                 <Toggle label="Preserve Hair" checked={settings.preserveHair} onChange={v => setSettings(s => ({...s, preserveHair: v}))} />
                 <Toggle label="Match Skin Tone" checked={settings.matchSkinTone} onChange={v => setSettings(s => ({...s, matchSkinTone: v}))} />
@@ -215,8 +232,7 @@ function App() {
               </div>
               <div className="mt-4">
                 <div className="flex justify-between text-xs mb-1 text-gray-400">
-                    <span>Skin Smoothness</span>
-                    <span>{settings.skinSmoothness}/10</span>
+                    <span>Skin Smoothness ({settings.skinSmoothness})</span>
                 </div>
                 <input 
                     type="range" min="0" max="10" step="1" 
@@ -227,8 +243,7 @@ function App() {
               </div>
               <div className="mt-4">
                 <div className="flex justify-between text-xs mb-1 text-gray-400">
-                    <span>Output Quality</span>
-                    <span>{settings.outputQuality}%</span>
+                    <span>Output Quality ({settings.outputQuality}%)</span>
                 </div>
                 <input 
                     type="range" min="0" max="100" step="5" 
@@ -239,25 +254,33 @@ function App() {
               </div>
           </div>
 
-          {/* ANALYSIS */}
           <div className="mt-4">
             <AnalysisPanel analysis={analysis} isLoading={isAnalyzing} />
           </div>
-
         </div>
       </div>
 
-      {/* MAIN CONTENT AREA */}
+      {/* MAIN CONTENT */}
       <div className="flex-1 flex flex-col bg-gray-950 relative overflow-hidden">
-        {/* Background Grid */}
         <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 pointer-events-none"></div>
         
         <div className="p-6 border-b border-gray-800 bg-gray-900/50 backdrop-blur-md flex justify-between items-center z-10">
         <div>
             <h2 className="text-lg font-semibold text-white">Target Workspace</h2>
-            <p className="text-sm text-gray-400">Add target images to process batch swaps</p>
+            <p className="text-sm text-gray-400">Batch processing optimized for cost</p>
         </div>
         <div className="flex gap-3">
+             {targets.some(t => t.status === 'completed') && (
+                <Button 
+                  variant="secondary" 
+                  onClick={downloadAll}
+                  isLoading={isZipping}
+                  className="bg-green-600 hover:bg-green-500 text-white"
+                >
+                  Download All ZIP
+                </Button>
+            )}
+
             <div className="relative overflow-hidden">
                 <Button variant="secondary" onClick={() => document.getElementById('target-upload')?.click()}>
                     + Add Target
@@ -267,9 +290,9 @@ function App() {
                 }} />
             </div>
             <Button 
-                disabled={!sourceFace || targets.filter(t => t.status === 'idle').length === 0}
-                onClick={startBatchProcessing}
-                isLoading={processingQueue.length > 0}
+                disabled={sourceFaces.length === 0 || targets.filter(t => t.status === 'idle').length === 0}
+                onClick={runBatchProcessor}
+                isLoading={isProcessingBatch}
             >
                 Run Batch ({targets.filter(t => t.status === 'idle').length})
             </Button>
@@ -279,62 +302,41 @@ function App() {
         <div className="flex-1 overflow-y-auto p-6">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {targets.map((target) => (
-                    <div key={target.id} className="relative group bg-gray-900 rounded-xl border border-gray-800 overflow-hidden shadow-lg transition-all hover:border-gray-600">
+                    <div key={target.id} className="relative group bg-gray-900 rounded-xl border border-gray-800 overflow-hidden shadow-lg">
                         <div className="aspect-[4/5] relative">
                             <img 
                                 src={target.processedUrl || target.originalUrl} 
-                                className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105" 
+                                className="w-full h-full object-cover" 
                                 alt="Target"
                             />
-                            
-                            {/* Status Overlays */}
                             {target.status === 'processing' && (
                                 <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center">
                                       <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-2"></div>
                                       <span className="text-sm font-mono text-blue-400">Nano Banana Working...</span>
                                 </div>
                             )}
-                            {target.status === 'failed' && (
-                                <div className="absolute inset-0 bg-red-900/80 flex items-center justify-center p-4 text-center">
-                                    <p className="text-white text-sm">Failed: {target.error}</p>
-                                </div>
-                            )}
                             {target.status === 'completed' && (
                                 <div className="absolute top-2 right-2">
-                                    <span className="bg-green-500 text-black text-xs font-bold px-2 py-1 rounded shadow-lg flex items-center gap-1">
-                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>
-                                        DONE
-                                    </span>
+                                    <span className="bg-green-500 text-black text-xs font-bold px-2 py-1 rounded shadow-lg">DONE</span>
+                                </div>
+                            )}
+                             {target.status === 'failed' && (
+                                <div className="absolute inset-0 bg-red-900/90 flex items-center justify-center p-4">
+                                    <span className="text-white text-xs">{target.error}</span>
                                 </div>
                             )}
                         </div>
-                        
-                        {/* Card Footer */}
                         <div className="p-3 flex justify-between items-center bg-gray-850 border-t border-gray-800">
-                            <span className="text-xs text-gray-500 font-mono truncate max-w-[120px]">{target.id.substring(0,8)}...</span>
-                            {target.status === 'completed' && target.processedUrl && (
-                                <a href={target.processedUrl} download={`swap_${target.id}.png`} className="text-blue-400 hover:text-blue-300 text-xs font-medium flex items-center gap-1">
-                                    Download <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                                </a>
-                            )}
-                            {target.status === 'idle' && (
-                                  <button onClick={() => {
-                                    setTargets(prev => prev.filter(p => p.id !== target.id));
-                                  }} className="text-red-500 hover:text-red-400">
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                                  </button>
-                            )}
+                             {target.status === 'completed' && target.processedUrl ? (
+                                <a href={target.processedUrl} download={`swap_${target.id}.png`} className="text-blue-400 hover:text-blue-300 text-xs font-medium">Download</a>
+                             ) : <span className="text-xs text-gray-500">{target.status}</span>}
+                            
+                            <button onClick={() => setTargets(prev => prev.filter(p => p.id !== target.id))} className="text-gray-500 hover:text-red-400">
+                                ×
+                            </button>
                         </div>
                     </div>
                 ))}
-                
-                {/* Empty State */}
-                {targets.length === 0 && (
-                    <div className="col-span-full h-64 flex flex-col items-center justify-center text-gray-600 border-2 border-dashed border-gray-800 rounded-2xl">
-                        <svg className="w-16 h-16 mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
-                        <p>No target images. Add images to start swapping.</p>
-                    </div>
-                )}
             </div>
         </div>
       </div>

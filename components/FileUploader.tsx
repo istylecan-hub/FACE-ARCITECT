@@ -4,8 +4,9 @@ interface FileUploaderProps {
   label: string;
   onFileSelect: (file: File) => void;
   accept?: string;
-  currentImage?: string | null;
+  currentImages?: string[]; 
   onClear?: () => void;
+  onRemoveSingle?: (index: number) => void;
   compact?: boolean;
   statusMessage?: string | null;
 }
@@ -14,34 +15,27 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
   label, 
   onFileSelect, 
   accept = "image/*", 
-  currentImage, 
+  currentImages = [], 
   onClear,
+  onRemoveSingle,
   compact = false,
   statusMessage
 }) => {
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      onFileSelect(e.dataTransfer.files[0]);
-    }
-  };
-
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       onFileSelect(e.target.files[0]);
     }
+    // Reset input so same file can be selected again if needed
+    if (inputRef.current) inputRef.current.value = '';
   };
 
+  const hasImages = currentImages && currentImages.length > 0;
+  const primaryImage = hasImages ? currentImages[0] : null;
+
   return (
-    <div className={`w-full ${compact ? 'h-32' : 'h-64'}`}>
+    <div className={`w-full ${compact ? 'h-auto' : 'h-64'}`}>
       <input
         type="file"
         ref={inputRef}
@@ -50,49 +44,63 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
         className="hidden"
       />
       
-      {currentImage ? (
-        <div className="relative w-full h-full rounded-xl overflow-hidden border border-gray-700 group">
-          <img src={currentImage} alt="Uploaded" className="w-full h-full object-cover" />
-          
-          {/* Status Message Banner (Auto-remember feature) */}
-          {statusMessage && (
-             <div className="absolute top-0 left-0 right-0 bg-blue-900/80 backdrop-blur-sm text-blue-100 text-[10px] font-medium py-1 px-2 text-center border-b border-blue-700/50 z-10">
-               {statusMessage}
-             </div>
-          )}
+      {hasImages ? (
+        <div className="space-y-2">
+            {/* Primary Image (Big) */}
+            <div className="relative w-full h-40 rounded-xl overflow-hidden border border-blue-500/50 group bg-gray-900">
+                <img src={primaryImage!} alt="Primary" className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" />
+                
+                {statusMessage && (
+                    <div className="absolute top-0 left-0 right-0 bg-blue-900/80 backdrop-blur-sm text-blue-100 text-[10px] font-medium py-1 text-center z-10">
+                        {statusMessage}
+                    </div>
+                )}
+                
+                <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent p-2 flex justify-between items-end">
+                    <span className="text-xs font-bold text-white px-1">Primary Face</span>
+                    {onClear && (
+                        <button onClick={(e) => { e.stopPropagation(); onClear(); }} className="text-xs bg-red-600/80 hover:bg-red-500 text-white px-2 py-1 rounded">
+                            Reset All
+                        </button>
+                    )}
+                </div>
+            </div>
 
-          <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
-            <button 
-              onClick={() => inputRef.current?.click()}
-              className="bg-blue-600 text-white px-3 py-1 rounded-md text-sm hover:bg-blue-500"
-            >
-              Change
-            </button>
-            {onClear && (
-               <button 
-               onClick={(e) => { e.stopPropagation(); onClear(); }}
-               className="bg-red-600 text-white px-3 py-1 rounded-md text-sm hover:bg-red-500"
-             >
-               Remove
-             </button>
-            )}
-          </div>
-          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-2">
-             <span className="text-xs font-semibold text-gray-200 px-1">{label}</span>
-          </div>
+            {/* Thumbnails (Add More) */}
+            <div className="flex gap-2 overflow-x-auto pb-1">
+                {currentImages.map((img, idx) => (
+                    <div key={idx} className="relative w-16 h-16 flex-shrink-0 rounded-lg overflow-hidden border border-gray-700 group">
+                        <img src={img} className="w-full h-full object-cover" alt={`Ref ${idx}`} />
+                        <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                            {idx > 0 && onRemoveSingle && (
+                                <button onClick={() => onRemoveSingle(idx)} className="text-red-400 hover:text-white">
+                                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                ))}
+                
+                {/* Add Button */}
+                {currentImages.length < 3 && (
+                    <button 
+                        onClick={() => inputRef.current?.click()}
+                        className="w-16 h-16 flex-shrink-0 rounded-lg border-2 border-dashed border-gray-700 hover:border-blue-500 hover:bg-gray-800 flex flex-col items-center justify-center text-gray-500 hover:text-blue-400 transition-colors"
+                    >
+                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                        <span className="text-[9px] mt-1 font-medium">Add Angle</span>
+                    </button>
+                )}
+            </div>
+            <p className="text-[10px] text-gray-400 text-center">Tip: Add Front, Side, and 45° views for best accuracy.</p>
         </div>
       ) : (
         <div 
           onClick={() => inputRef.current?.click()}
-          onDragOver={handleDragOver}
-          onDrop={handleDrop}
-          className="w-full h-full border-2 border-dashed border-gray-700 rounded-xl flex flex-col items-center justify-center cursor-pointer hover:border-blue-500 hover:bg-gray-800/30 transition-all text-gray-400 group"
+          className="w-full h-32 border-2 border-dashed border-gray-700 rounded-xl flex flex-col items-center justify-center cursor-pointer hover:border-blue-500 hover:bg-gray-800/30 transition-all text-gray-400"
         >
-          <svg className="w-10 h-10 mb-2 group-hover:text-blue-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-          </svg>
-          <span className="text-sm font-medium">{label}</span>
-          <span className="text-xs text-gray-500 mt-1">Click or drag image</span>
+          <svg className="w-8 h-8 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+          <span className="text-xs font-medium">Upload Source Face</span>
         </div>
       )}
     </div>

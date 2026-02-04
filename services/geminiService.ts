@@ -1,40 +1,64 @@
 import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { FaceAnalysisResult, ModelType, SwapSettings } from "../types";
 
-// Helper to remove data URL prefix
 const stripBase64 = (dataUrl: string) => {
   return dataUrl.split(',')[1] || dataUrl;
 };
 
-// Initialize Gemini Client
 const getClient = () => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) {
-    throw new Error("API Key not found in environment variables");
-  }
+  const apiKey = process.env.API_KEY; 
+  if (!apiKey) throw new Error("API Key not found");
   return new GoogleGenAI({ apiKey });
+};
+
+// COST SAVER: Resize image for Analysis to 800px max (Reduces tokens significantly)
+const resizeForAnalysis = async (base64Str: string, maxDim = 800): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      let width = img.width;
+      let height = img.height;
+      if (width > height) {
+        if (width > maxDim) { height *= maxDim / width; width = maxDim; }
+      } else {
+        if (height > maxDim) { width *= maxDim / height; height = maxDim; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', 0.8));
+      } else {
+        reject(new Error("Canvas context failed"));
+      }
+    };
+    img.onerror = () => reject(new Error("Image load failed"));
+    img.src = base64Str;
+  });
 };
 
 export const analyzeFace = async (imageBase64: string): Promise<FaceAnalysisResult> => {
   const client = getClient();
-  
+  const optimizedImage = await resizeForAnalysis(imageBase64);
+
   const schema: Schema = {
     type: Type.OBJECT,
     properties: {
-      face_box: { type: Type.ARRAY, items: { type: Type.NUMBER }, description: "Bounding box [ymin, xmin, ymax, xmax]" },
+      face_box: { type: Type.ARRAY, items: { type: Type.NUMBER } },
       landmarks: { 
         type: Type.OBJECT, 
         properties: {
-          left_eye: { type: Type.ARRAY, items: { type: Type.NUMBER }, description: "Left eye coordinates [x, y]" },
-          right_eye: { type: Type.ARRAY, items: { type: Type.NUMBER }, description: "Right eye coordinates [x, y]" },
-          nose_tip: { type: Type.ARRAY, items: { type: Type.NUMBER }, description: "Nose tip coordinates [x, y]" },
-          mouth_center: { type: Type.ARRAY, items: { type: Type.NUMBER }, description: "Mouth center coordinates [x, y]" },
-          jawline: { type: Type.ARRAY, items: { type: Type.ARRAY, items: { type: Type.NUMBER } }, description: "Array of points along the jawline" }
-        }, 
-        description: "Key facial landmarks" 
+          left_eye: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+          right_eye: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+          nose_tip: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+          mouth_center: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+          jawline: { type: Type.ARRAY, items: { type: Type.ARRAY, items: { type: Type.NUMBER } } }
+        } 
       },
-      skin_tone: { type: Type.STRING, description: "Estimated skin tone (e.g., Fair, Medium, Dark)" },
-      undertone: { type: Type.STRING, description: "Warm, Cool, or Neutral" },
+      skin_tone: { type: Type.STRING },
+      undertone: { type: Type.STRING },
       lighting: {
         type: Type.OBJECT,
         properties: {
@@ -43,24 +67,24 @@ export const analyzeFace = async (imageBase64: string): Promise<FaceAnalysisResu
           color_temperature: { type: Type.STRING }
         }
       },
-      face_scale_ratio: { type: Type.NUMBER, description: "Ratio of face area to total image area" },
+      face_scale_ratio: { type: Type.NUMBER },
       confidence: { type: Type.NUMBER }
     },
     required: ["face_box", "skin_tone", "lighting", "landmarks"]
   };
 
   const response = await client.models.generateContent({
-    model: ModelType.GEMINI_3_PRO,
+    // STRICTLY USING FLASH FOR ANALYSIS
+    model: 'gemini-3-flash-preview', 
     contents: {
       parts: [
-        { inlineData: { mimeType: "image/png", data: stripBase64(imageBase64) } },
-        { text: "Analyze the primary face in this image. Extract landmarks, skin tone, lighting conditions, and face scale." }
+        { inlineData: { mimeType: "image/jpeg", data: stripBase64(optimizedImage) } },
+        { text: "Analyze the primary face. Output strict JSON." }
       ]
     },
     config: {
       responseMimeType: "application/json",
       responseSchema: schema,
-      systemInstruction: "You are an expert computer vision analyzer. Output strict JSON."
     }
   });
 
@@ -70,59 +94,69 @@ export const analyzeFace = async (imageBase64: string): Promise<FaceAnalysisResu
 };
 
 export const performFaceSwap = async (
-  sourceFaceBase64: string,
+  sourceFacesBase64: string[], 
   targetImageBase64: string,
   settings: SwapSettings
 ): Promise<string> => {
   const client = getClient();
 
-  // Construct a detailed prompt based on settings
   const promptParts = [
-    "You are a professional image editor using the Nano Banana Pro engine.",
-    "Task: Replace the face in the SECOND image (Target) with the face from the FIRST image (Source).",
-    "CRITICAL: Do NOT morph the faces. The goal is to fully swap the identity so the person looks exactly like the Source.",
-    "CONSTRAINTS:",
-    "- Replace eyes, nose, mouth, and facial structure completely with the Source identity.",
-    "- Preserve the neck, body, outfit, pose, and background of the Target image exactly.",
-    "- Seamlessly blend the edges (forehead, jawline) without altering the Source identity.",
-    settings.preserveHair ? "- Preserve the hair of the Target image." : "- Adapt the hair from the Source if it fits better, otherwise keep Target hair.",
-    settings.matchSkinTone ? "- Color grade the Source face to match the Target body's skin tone exactly." : "- Keep original Source skin tone.",
-    settings.matchLighting ? "- Re-light the Source face to match the Target scene's lighting direction and intensity." : "",
-    ` - Apply a skin smoothness level of ${settings.skinSmoothness}/10.`,
-    ` - Generate with an output quality/fidelity level of ${settings.outputQuality}/100.`,
-    "Output only the final high-quality image."
+    "You are an expert VFX artist.",
+    "MISSION: Swap the face in the FINAL Target image with the identity provided in the Reference images.",
+    "",
+    `INPUT CONTEXT: You have been provided with ${sourceFacesBase64.length} reference images of the Source Identity.`,
+    "Use ALL reference images to build a complete 3D understanding of the Source's facial structure, profiles, and unique features.",
+    "",
+    "STRICT IDENTITY REQUIREMENTS:",
+    "1. LIKENESS: The output face must look EXACTLY like the Source identity.",
+    "2. ANGLE HANDLING: If the Target is side-profile, use the side-profile Reference to ensure the nose and jawline are accurate.",
+    "3. EYES: Strictly maintain the Source's eye shape and pupil distance.",
+    "",
+    "SETTINGS:",
+    settings.preserveHair ? "- Preserve Target hair." : "- Adapt Source hair.",
+    settings.matchSkinTone ? "- Grade Source skin to match Target body." : "- Keep Source skin tone.",
+    settings.matchLighting ? "- Relight Source to match Target scene." : "",
+    ` - Skin Smoothness: ${settings.skinSmoothness}/10`,
+    ` - Fidelity: ${settings.outputQuality}/100`,
+    "",
+    "Output only the final image."
   ];
 
+  // Prepare content parts
+  const contentParts = [];
+  
+  // 1. Add All Source Faces
+  sourceFacesBase64.forEach((face, index) => {
+      contentParts.push({ 
+          inlineData: { mimeType: "image/png", data: stripBase64(face) } 
+      });
+      contentParts.push({ text: `Reference Image ${index + 1} (Source Identity)` });
+  });
+
+  // 2. Add Target Image
+  contentParts.push({ 
+      inlineData: { mimeType: "image/png", data: stripBase64(targetImageBase64) } 
+  });
+  contentParts.push({ text: "Target Image (Swap Destination)" });
+
+  // 3. Add Prompt
+  contentParts.push({ text: promptParts.join("\n") });
+
   const response = await client.models.generateContent({
-    model: ModelType.GEMINI_3_PRO_IMAGE, // Maps to Nano Banana Pro for high quality
+    model: ModelType.GEMINI_3_PRO_IMAGE,
     contents: {
-      parts: [
-        { inlineData: { mimeType: "image/png", data: stripBase64(sourceFaceBase64) } },
-        { inlineData: { mimeType: "image/png", data: stripBase64(targetImageBase64) } },
-        { text: promptParts.join("\n") }
-      ]
+      parts: contentParts
     },
-    config: {
-      // imageConfig for gemini-3-pro-image-preview
-      imageConfig: {
-        // We generally want to maintain the aspect ratio/size logic implicitly, 
-        // but the API requires specific enums if set. 
-        // We'll let the model infer from context or default to 1:1 if not specified, 
-        // but often 'generateContent' for image editing just returns the image.
-        // For 'gemini-3-pro-image-preview', we can request higher res.
-        imageSize: "2K" 
-      }
+    config: { 
+      imageConfig: { imageSize: "2K" } 
     }
   });
 
-  // Extract image
-  // The response structure for generateContent with image output:
-  // candidates[0].content.parts[...].inlineData
   for (const part of response.candidates?.[0]?.content?.parts || []) {
     if (part.inlineData && part.inlineData.data) {
       return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
     }
   }
   
-  throw new Error("No image generated in response");
+  throw new Error("No image generated");
 };

@@ -1,6 +1,7 @@
 export enum ModelType {
   GEMINI_3_PRO = 'gemini-3-pro-preview',
   GEMINI_3_PRO_IMAGE = 'gemini-3-pro-image-preview', // Nano Banana Pro
+  GEMINI_FLASH_ANALYSIS = 'gemini-3-flash-preview', // Low cost model for JSON/Analysis
   GEMINI_2_5_FLASH_IMAGE = 'gemini-2.5-flash-image', // Nano Banana
 }
 
@@ -38,13 +39,13 @@ export interface ProcessedImage {
 
 export interface AppSessionState {
   targets: ProcessedImage[];
-  sourceFace?: string;
+  sourceFaces: string[]; // Changed to array
   analysis?: FaceAnalysisResult;
 }
 
 export interface UserPreferences {
   last_used_source?: {
-    image: string; // base64
+    images: string[]; // Changed to array
     analysis: FaceAnalysisResult;
     timestamp: number;
   };
