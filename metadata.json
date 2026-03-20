@@ -1,5 +1,5 @@
 {
   "name": "Gemini Face Architect",
-  "description": "Professional AI-powered face swapping and image editing suite using Gemini 3 Pro and Nano Banana Pro models.",
+  "description": "Professional AI-powered face swapping and image editing suite using Gemini 3.1 Pro and 3.1 Flash Image models.",
   "requestFramePermissions": []
 }
