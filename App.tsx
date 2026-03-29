@@ -45,6 +45,11 @@ function App() {
   const [isZipping, setIsZipping] = useState(false);
   const [autoRestoreMsg, setAutoRestoreMsg] = useState<string | null>(null);
 
+  // Add at top of App component, after state declarations:
+  const sourceFacesRef = React.useRef<string[]>([]);
+  // Keep ref in sync:
+  useEffect(() => { sourceFacesRef.current = sourceFaces; }, [sourceFaces]);
+
   // Check for API Key
   useEffect(() => {
     const checkKey = async () => {
@@ -132,7 +137,7 @@ function App() {
       });
 
       // Only analyze if it's the first image (Primary)
-      if (sourceFaces.length === 0) {
+      if (sourceFacesRef.current.length === 0) {
         setAnalysis(null);
         setAutoRestoreMsg(null); 
         
@@ -181,27 +186,29 @@ function App() {
     if (sourceFaces.length === 0) return;
     setIsProcessingBatch(true);
 
-    // Snapshot idle targets ONCE to avoid stale closure reads
     const idleTargets = targets.filter(t => t.status === 'idle');
+    const batchTotal = idleTargets.length;
 
-    for (const target of idleTargets) {
+    for (let i = 0; i < idleTargets.length; i++) {
+      const target = idleTargets[i];
       setTargets(prev => prev.map(t => t.id === target.id
-        ? { ...t, status: 'processing', progressMsg: 'Starting...' } : t));
+        ? { ...t, status: 'processing', progressMsg: `Starting (${i + 1}/${batchTotal})...` } : t));
       try {
         const swappedImage = await performFaceSwap(
           sourceFaces,
           target.originalUrl,
           settings,
-          analysis,           // pass source face analysis for context injection
-          (stage: string) => {  // per-card progress label
+          analysis,
+          (stage: string) => {
             setTargets(prev => prev.map(t => t.id === target.id
-              ? { ...t, progressMsg: stage } : t));
-          }
+              ? { ...t, progressMsg: `[${i + 1}/${batchTotal}] ${stage}` } : t));
+          },
+          i,          // batchIndex
+          batchTotal  // batchTotal
         );
         setTargets(prev => prev.map(t => t.id === target.id
           ? { ...t, status: 'completed', processedUrl: swappedImage, progressMsg: undefined } : t));
       } catch (error) {
-        // If permission denied, reset key state to prompt again
         if (error instanceof Error && (error.message.includes('403') || error.message.includes('PERMISSION_DENIED'))) {
              setHasApiKey(false);
         }
@@ -244,7 +251,7 @@ function App() {
           </div>
           <h2 className="text-2xl font-bold text-white mb-3">API Key Required</h2>
           <p className="text-gray-400 mb-8 leading-relaxed">
-            Gemini Architect uses the <strong>Gemini 3.1 Flash Image</strong> model, which requires a paid API key from a Google Cloud project.
+            Gemini Architect uses the <strong>Gemini 3 Pro Image</strong> model, which requires a paid API key from a Google Cloud project.
           </p>
           <Button onClick={handleSelectKey} className="w-full py-4 text-lg">
             Select API Key
@@ -264,8 +271,8 @@ function App() {
       {/* SIDEBAR */}
       <div className="w-80 border-r border-gray-800 flex flex-col bg-gray-900 z-10 shadow-2xl">
         <div className="p-4 border-b border-gray-800">
-            <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">Gemini Architect</h1>
-            <p className="text-xs text-gray-500 mt-1">Engine: Gemini 3.1 Pro + 3.1 Flash Image</p>
+            <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">Gemini Architect Pro</h1>
+            <p className="text-xs text-gray-500 mt-1">Engine: Gemini 3.1 Pro + 3 Pro Image</p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
@@ -288,6 +295,7 @@ function App() {
                 <Toggle label="Preserve Hair" checked={settings.preserveHair} onChange={v => setSettings(s => ({...s, preserveHair: v}))} />
                 <Toggle label="Match Skin Tone" checked={settings.matchSkinTone} onChange={v => setSettings(s => ({...s, matchSkinTone: v}))} />
                 <Toggle label="Match Lighting" checked={settings.matchLighting} onChange={v => setSettings(s => ({...s, matchLighting: v}))} />
+                <Toggle label="Strict Face Scale" checked={settings.faceScaleLock === 'fixed'} onChange={v => setSettings(s => ({...s, faceScaleLock: v ? 'fixed' : 'auto'}))} />
               </div>
               <div className="mt-4">
                 <div className="flex justify-between text-xs mb-1 text-gray-400">
